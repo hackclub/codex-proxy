@@ -58,11 +58,11 @@
       <h2>Create API key</h2>
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <label for="username">Username</label>
-      <input id="username" name="username" placeholder="max" required>
+      <input id="username" name="username" placeholder="HC Username" required>
       <label for="app-name">App name</label>
-      <input id="app-name" name="app_name" placeholder="big-mac" required>
+      <input id="app-name" name="app_name" placeholder="App Name" required>
       <label for="machine-name">Machine name</label>
-      <input id="machine-name" name="machine_name" placeholder="review-worker-1" required>
+      <input id="machine-name" name="machine_name" placeholder="Machine" required>
       <label for="rate">Requests per second</label>
       <input id="rate" name="rate_limit_rps" type="number" min="0.1" step="0.1" placeholder="10">
       <button type="submit">Create key</button>
