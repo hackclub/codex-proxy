@@ -25,6 +25,31 @@ type streamEvent struct {
 	Item     json.RawMessage `json:"item,omitempty"`
 }
 
+type responseDetails struct {
+	ID                string
+	Model             string
+	Status            string
+	ServiceTier       string
+	InputTokens       int64
+	CachedTokens      int64
+	CacheWriteTokens  int64
+	OutputTokens      int64
+	ReasoningTokens   int64
+	TotalTokens       int64
+	WebSearchRequests int64
+	ImageGen          struct {
+		InputTokens       int64
+		InputImageTokens  int64
+		InputTextTokens   int64
+		OutputTokens      int64
+		OutputImageTokens int64
+		OutputTextTokens  int64
+		TotalTokens       int64
+	}
+	Error             json.RawMessage
+	IncompleteDetails json.RawMessage
+}
+
 type streamState struct {
 	fallbackModel string
 	text          strings.Builder
@@ -35,10 +60,10 @@ type streamState struct {
 	streamError   bool
 }
 
-func RelaySSE(w http.ResponseWriter, body io.Reader, fallbackModel string) error {
+func RelaySSE(w http.ResponseWriter, body io.Reader, fallbackModel string) (responseDetails, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		return errors.New("response writer does not support streaming")
+		return responseDetails{}, errors.New("response writer does not support streaming")
 	}
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -90,17 +115,17 @@ func RelaySSE(w http.ResponseWriter, body io.Reader, fallbackModel string) error
 	if err != nil {
 		frame, _ := json.Marshal(map[string]any{"type": "error", "message": "upstream stream ended unexpectedly"})
 		_ = writeSSEEvent(w, flusher, "error", string(frame))
-		return err
+		return responseDetailsFrom(state.terminal), err
 	}
 	if state.terminalType == "" {
 		frame, _ := json.Marshal(map[string]any{"type": "error", "message": "upstream stream ended without a terminal event"})
 		_ = writeSSEEvent(w, flusher, "error", string(frame))
-		return errors.New("upstream stream ended without a terminal event")
+		return responseDetails{}, errors.New("upstream stream ended without a terminal event")
 	}
-	return nil
+	return responseDetailsFrom(state.terminal), nil
 }
 
-func BufferSSE(body io.Reader, fallbackModel string) ([]byte, error) {
+func BufferSSE(body io.Reader, fallbackModel string) ([]byte, responseDetails, error) {
 	state := &streamState{fallbackModel: fallbackModel}
 	err := iterateSSE(body, func(event sseEvent) error {
 		data := strings.TrimSpace(event.Data)
@@ -114,31 +139,109 @@ func BufferSSE(body io.Reader, fallbackModel string) ([]byte, error) {
 		return state.remember(parsed, eventType)
 	})
 	if err != nil {
-		return nil, err
+		return nil, responseDetailsFrom(state.terminal), err
 	}
 	if state.terminalType == "" {
-		return nil, errors.New("upstream stream ended without a terminal event")
+		return nil, responseDetails{}, errors.New("upstream stream ended without a terminal event")
 	}
+	details := responseDetailsFrom(state.terminal)
 	if state.streamError {
-		return nil, errors.New("upstream sent an error event")
+		return nil, details, errors.New("upstream sent an error event")
 	}
 	if state.terminalType == "response.failed" {
-		return nil, errors.New("upstream response failed")
+		return nil, details, errors.New("upstream response failed")
 	}
 	if responseHasOutput(state.terminal) {
-		return state.terminal, nil
+		return state.terminal, details, nil
 	}
 	if state.terminalType == "response.incomplete" && len(state.output) == 0 && state.text.Len() == 0 {
-		return nil, errors.New("upstream response was incomplete and contained no output")
+		return nil, details, errors.New("upstream response was incomplete and contained no output")
 	}
 	patched, _, err := state.patchTerminal(state.terminal)
 	if err != nil {
-		return nil, err
+		return nil, details, err
 	}
 	if !responseHasOutput(patched) {
-		return nil, errors.New("upstream stream completed without output")
+		return nil, details, errors.New("upstream stream completed without output")
 	}
-	return patched, nil
+	return patched, details, nil
+}
+
+func responseDetailsFrom(raw json.RawMessage) responseDetails {
+	var response struct {
+		ID                string          `json:"id"`
+		Model             string          `json:"model"`
+		Status            string          `json:"status"`
+		ServiceTier       string          `json:"service_tier"`
+		Error             json.RawMessage `json:"error"`
+		IncompleteDetails json.RawMessage `json:"incomplete_details"`
+		Usage             *struct {
+			InputTokens       int64 `json:"input_tokens"`
+			InputTokenDetails struct {
+				CachedTokens     int64 `json:"cached_tokens"`
+				CacheWriteTokens int64 `json:"cache_write_tokens"`
+			} `json:"input_tokens_details"`
+			OutputTokens       int64 `json:"output_tokens"`
+			OutputTokenDetails struct {
+				ReasoningTokens int64 `json:"reasoning_tokens"`
+			} `json:"output_tokens_details"`
+			TotalTokens int64 `json:"total_tokens"`
+		} `json:"usage"`
+		ToolUsage struct {
+			WebSearch struct {
+				Requests int64 `json:"num_requests"`
+			} `json:"web_search"`
+			ImageGen struct {
+				InputTokens       int64 `json:"input_tokens"`
+				InputTokenDetails struct {
+					ImageTokens int64 `json:"image_tokens"`
+					TextTokens  int64 `json:"text_tokens"`
+				} `json:"input_tokens_details"`
+				OutputTokens       int64 `json:"output_tokens"`
+				OutputTokenDetails struct {
+					ImageTokens int64 `json:"image_tokens"`
+					TextTokens  int64 `json:"text_tokens"`
+				} `json:"output_tokens_details"`
+				TotalTokens int64 `json:"total_tokens"`
+			} `json:"image_gen"`
+		} `json:"tool_usage"`
+	}
+	if json.Unmarshal(raw, &response) != nil {
+		return responseDetails{}
+	}
+
+	details := responseDetails{
+		ID:                response.ID,
+		Model:             response.Model,
+		Status:            response.Status,
+		ServiceTier:       response.ServiceTier,
+		WebSearchRequests: response.ToolUsage.WebSearch.Requests,
+		Error:             nonNullJSON(response.Error),
+		IncompleteDetails: nonNullJSON(response.IncompleteDetails),
+	}
+	if response.Usage != nil {
+		details.InputTokens = response.Usage.InputTokens
+		details.CachedTokens = response.Usage.InputTokenDetails.CachedTokens
+		details.CacheWriteTokens = response.Usage.InputTokenDetails.CacheWriteTokens
+		details.OutputTokens = response.Usage.OutputTokens
+		details.ReasoningTokens = response.Usage.OutputTokenDetails.ReasoningTokens
+		details.TotalTokens = response.Usage.TotalTokens
+	}
+	details.ImageGen.InputTokens = response.ToolUsage.ImageGen.InputTokens
+	details.ImageGen.InputImageTokens = response.ToolUsage.ImageGen.InputTokenDetails.ImageTokens
+	details.ImageGen.InputTextTokens = response.ToolUsage.ImageGen.InputTokenDetails.TextTokens
+	details.ImageGen.OutputTokens = response.ToolUsage.ImageGen.OutputTokens
+	details.ImageGen.OutputImageTokens = response.ToolUsage.ImageGen.OutputTokenDetails.ImageTokens
+	details.ImageGen.OutputTextTokens = response.ToolUsage.ImageGen.OutputTokenDetails.TextTokens
+	details.ImageGen.TotalTokens = response.ToolUsage.ImageGen.TotalTokens
+	return details
+}
+
+func nonNullJSON(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	return raw
 }
 
 func (s *streamState) remember(event streamEvent, eventType string) error {

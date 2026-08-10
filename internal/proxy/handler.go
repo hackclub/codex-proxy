@@ -76,7 +76,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !h.limiter.Allow(apiKey.ID, apiKey.RateLimitRPS) {
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusTooManyRequests, "rate_limit_error", "proxy API key rate limit exceeded")
-		h.record(apiKey.ID, "", "", http.StatusTooManyRequests, time.Since(started), false, "rate limit exceeded")
+		h.record(started, db.RequestRecord{
+			APIKeyID: apiKey.ID, StatusCode: http.StatusTooManyRequests, ErrorMessage: "rate limit exceeded",
+		})
 		return
 	}
 
@@ -97,66 +99,89 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	record := db.RequestRecord{APIKeyID: apiKey.ID, Model: metadata.Model, Streamed: metadata.DownstreamStream}
 
 	token, upstreamResponse, err := h.callUpstream(r.Context(), patchedBody, metadata)
 	if err != nil {
 		log.Printf("upstream request failed: %v", err)
 		writeError(w, http.StatusBadGateway, "upstream_error", "Codex upstream request failed")
-		h.record(apiKey.ID, token.ID, metadata.Model, http.StatusBadGateway, time.Since(started), metadata.DownstreamStream, err.Error())
+		record.TokenID = token.ID
+		record.StatusCode = http.StatusBadGateway
+		record.ErrorMessage = err.Error()
+		h.record(started, record)
 		return
 	}
 	defer upstreamResponse.Body.Close()
+	record.TokenID = token.ID
+	record.UpstreamRequestID = upstreamResponse.Header.Get("X-OAI-Request-ID")
+	record.CodexHeaders = codexHeaders(upstreamResponse.Header)
 
-	w.Header().Set("X-Codex-Proxy-Client", apiKey.Name)
+	w.Header().Set("X-Codex-Proxy-Client", apiKey.Label())
 	w.Header().Set("X-Codex-Proxy-Token", token.Label)
 	copyResponseHeaders(w.Header(), upstreamResponse.Header)
 
 	if upstreamResponse.StatusCode < 200 || upstreamResponse.StatusCode >= 300 {
+		responseBody, readErr := io.ReadAll(upstreamResponse.Body)
+		applyResponseDetails(&record, responseDetailsFrom(responseBody))
 		w.WriteHeader(upstreamResponse.StatusCode)
-		_, copyErr := io.Copy(w, upstreamResponse.Body)
+		_, writeErr := w.Write(responseBody)
 		errorMessage := fmt.Sprintf("upstream HTTP %d", upstreamResponse.StatusCode)
-		if copyErr != nil {
-			errorMessage += ": " + copyErr.Error()
+		if readErr != nil {
+			errorMessage += ": " + readErr.Error()
+		} else if writeErr != nil {
+			errorMessage += ": " + writeErr.Error()
 		}
-		h.record(apiKey.ID, token.ID, metadata.Model, upstreamResponse.StatusCode, time.Since(started), metadata.DownstreamStream, errorMessage)
+		record.StatusCode = upstreamResponse.StatusCode
+		record.ErrorMessage = errorMessage
+		h.record(started, record)
 		return
 	}
 
 	contentType := strings.ToLower(upstreamResponse.Header.Get("Content-Type"))
 	if strings.Contains(contentType, "application/json") {
+		responseBody, readErr := io.ReadAll(upstreamResponse.Body)
+		applyResponseDetails(&record, responseDetailsFrom(responseBody))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(upstreamResponse.StatusCode)
-		_, copyErr := io.Copy(w, upstreamResponse.Body)
+		_, writeErr := w.Write(responseBody)
 		errorMessage := ""
-		if copyErr != nil {
-			errorMessage = copyErr.Error()
+		if readErr != nil {
+			errorMessage = readErr.Error()
+		} else if writeErr != nil {
+			errorMessage = writeErr.Error()
 		}
-		h.record(apiKey.ID, token.ID, metadata.Model, upstreamResponse.StatusCode, time.Since(started), metadata.DownstreamStream, errorMessage)
+		record.StatusCode = upstreamResponse.StatusCode
+		record.ErrorMessage = errorMessage
+		h.record(started, record)
 		return
 	}
 
 	if metadata.DownstreamStream {
-		err = RelaySSE(w, upstreamResponse.Body, metadata.Model)
-		status := http.StatusOK
-		errorMessage := ""
+		details, err := RelaySSE(w, upstreamResponse.Body, metadata.Model)
+		applyResponseDetails(&record, details)
+		record.StatusCode = http.StatusOK
 		if err != nil {
-			errorMessage = err.Error()
+			record.ErrorMessage = err.Error()
 		}
-		h.record(apiKey.ID, token.ID, metadata.Model, status, time.Since(started), true, errorMessage)
+		h.record(started, record)
 		return
 	}
 
-	responseJSON, err := BufferSSE(upstreamResponse.Body, metadata.Model)
+	responseJSON, details, err := BufferSSE(upstreamResponse.Body, metadata.Model)
+	applyResponseDetails(&record, details)
 	if err != nil {
 		log.Printf("buffer upstream SSE: %v", err)
 		writeError(w, http.StatusBadGateway, "upstream_error", "Codex stream could not be converted to a response")
-		h.record(apiKey.ID, token.ID, metadata.Model, http.StatusBadGateway, time.Since(started), false, err.Error())
+		record.StatusCode = http.StatusBadGateway
+		record.ErrorMessage = err.Error()
+		h.record(started, record)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(responseJSON)
-	h.record(apiKey.ID, token.ID, metadata.Model, http.StatusOK, time.Since(started), false, "")
+	record.StatusCode = http.StatusOK
+	h.record(started, record)
 }
 
 func (h *Handler) callUpstream(ctx context.Context, body []byte, metadata RequestMetadata) (db.Token, *http.Response, error) {
@@ -202,20 +227,50 @@ func (h *Handler) callUpstream(ctx context.Context, body []byte, metadata Reques
 	return lastToken, nil, errors.New("upstream authentication failed")
 }
 
-func (h *Handler) record(apiKeyID, tokenID, model string, status int, duration time.Duration, streamed bool, errorMessage string) {
+func (h *Handler) record(started time.Time, record db.RequestRecord) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := h.store.RecordRequest(ctx, db.RequestRecord{
-		APIKeyID:     apiKeyID,
-		TokenID:      tokenID,
-		Model:        model,
-		StatusCode:   status,
-		Duration:     duration,
-		Streamed:     streamed,
-		ErrorMessage: errorMessage,
-	}); err != nil {
+	record.Duration = time.Since(started)
+	if err := h.store.RecordRequest(ctx, record); err != nil {
 		log.Printf("record request: %v", err)
 	}
+}
+
+func applyResponseDetails(record *db.RequestRecord, details responseDetails) {
+	record.ResponseID = details.ID
+	record.ResponseModel = details.Model
+	record.ResponseStatus = details.Status
+	record.ServiceTier = details.ServiceTier
+	record.InputTokens = details.InputTokens
+	record.CachedTokens = details.CachedTokens
+	record.CacheWriteTokens = details.CacheWriteTokens
+	record.OutputTokens = details.OutputTokens
+	record.ReasoningTokens = details.ReasoningTokens
+	record.TotalTokens = details.TotalTokens
+	record.WebSearchRequests = details.WebSearchRequests
+	record.ImageGenInputTokens = details.ImageGen.InputTokens
+	record.ImageGenInputImageTokens = details.ImageGen.InputImageTokens
+	record.ImageGenInputTextTokens = details.ImageGen.InputTextTokens
+	record.ImageGenOutputTokens = details.ImageGen.OutputTokens
+	record.ImageGenOutputImageTokens = details.ImageGen.OutputImageTokens
+	record.ImageGenOutputTextTokens = details.ImageGen.OutputTextTokens
+	record.ImageGenTotalTokens = details.ImageGen.TotalTokens
+	record.ResponseError = string(details.Error)
+	record.IncompleteDetails = string(details.IncompleteDetails)
+}
+
+func codexHeaders(headers http.Header) string {
+	values := make(map[string][]string)
+	for key, value := range headers {
+		if strings.HasPrefix(strings.ToLower(key), "x-codex-") {
+			values[key] = value
+		}
+	}
+	if len(values) == 0 {
+		return ""
+	}
+	encoded, _ := json.Marshal(values)
+	return string(encoded)
 }
 
 func requestAPIKey(r *http.Request) string {

@@ -14,8 +14,9 @@
     h2 { margin-top: 40px; }
     .muted { color: #8b949e; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 24px 0; }
-    .card, form, .notice, .error { border: 1px solid #30363d; border-radius: 10px; background: #161b22; padding: 16px; }
+    .card, form, .notice { border: 1px solid #30363d; border-radius: 10px; background: #161b22; padding: 16px; }
     .metric { font-size: 30px; font-weight: 700; margin-top: 6px; }
+    .detail { color: #8b949e; font-size: 13px; margin-top: 5px; }
     .forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 16px; }
     label { display: block; color: #8b949e; font-size: 13px; margin: 12px 0 5px; }
     input { width: 100%; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; color: #e6edf3; padding: 9px 10px; font: inherit; }
@@ -27,22 +28,27 @@
     .healthy { color: #3fb950; }
     .unhealthy { color: #f85149; }
     .notice { border-color: #2ea043; margin: 18px 0; }
-    .error { border-color: #f85149; margin: 18px 0; }
     pre { overflow-wrap: anywhere; white-space: pre-wrap; color: #79c0ff; }
     .inline { display: inline; border: 0; padding: 0; background: transparent; }
   </style>
 </head>
 <body>
 <main>
-  <h1>codex-proxy</h1>
-  <div class="muted">subscription-backed Responses API control plane</div>
+  <header>
+    <h1>codex-proxy</h1>
+    <div class="muted">subscription-backed Responses API control plane</div>
+  </header>
 
   {{if .Notice}}<div class="notice">{{.Notice}}</div>{{end}}
   {{if .CreatedKey}}<div class="notice"><strong>Copy this key now:</strong><pre>{{.CreatedKey}}</pre></div>{{end}}
 
   <section class="grid">
-    <div class="card"><div class="muted">Total requests</div><div class="metric">{{.Stats.TotalRequests}}</div></div>
-    <div class="card"><div class="muted">Today</div><div class="metric">{{.Stats.TodayRequests}}</div></div>
+    <div class="card"><div class="muted">Total requests</div><div class="metric">{{.Stats.TotalRequests}}</div><div class="detail">{{.Stats.TodayRequests}} today</div></div>
+    <div class="card"><div class="muted">Total tokens</div><div class="metric">{{.Stats.TotalTokens}}</div></div>
+    <div class="card"><div class="muted">Input tokens</div><div class="metric">{{.Stats.InputTokens}}</div><div class="detail">{{.Stats.CachedTokens}} cached · {{.Stats.CacheWriteTokens}} cache writes</div></div>
+    <div class="card"><div class="muted">Output tokens</div><div class="metric">{{.Stats.OutputTokens}}</div><div class="detail">{{.Stats.ReasoningTokens}} reasoning</div></div>
+    <div class="card"><div class="muted">Web searches</div><div class="metric">{{.Stats.WebSearchRequests}}</div></div>
+    <div class="card"><div class="muted">Image generation</div><div class="metric">{{.Stats.ImageGenTotalTokens}}</div><div class="detail">tokens</div></div>
     <div class="card"><div class="muted">Active clients</div><div class="metric">{{.Stats.ActiveAPIKeys}}</div></div>
     <div class="card"><div class="muted">Healthy tokens</div><div class="metric">{{.Stats.HealthyTokens}}</div></div>
   </section>
@@ -51,15 +57,19 @@
     <form action="/admin/keys" method="post">
       <h2>Create API key</h2>
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-      <label for="key-name">Name</label>
-      <input id="key-name" name="name" placeholder="big-mac-prod" required>
+      <label for="username">Username</label>
+      <input id="username" name="username" placeholder="max" required>
+      <label for="app-name">App name</label>
+      <input id="app-name" name="app_name" placeholder="big-mac" required>
+      <label for="machine-name">Machine name</label>
+      <input id="machine-name" name="machine_name" placeholder="review-worker-1" required>
       <label for="rate">Requests per second</label>
-      <input id="rate" name="rate_limit_rps" type="number" min="0.1" step="0.1" value="10" required>
+      <input id="rate" name="rate_limit_rps" type="number" min="0.1" step="0.1" placeholder="10">
       <button type="submit">Create key</button>
     </form>
 
     <form action="/admin/tokens" method="post">
-      <h2>Add or replace token</h2>
+      <h2>Add or replace donated token</h2>
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <label for="label">Label</label>
       <input id="label" name="label" placeholder="max-plus" required>
@@ -73,15 +83,15 @@
 
   <h2>API keys</h2>
   <table>
-    <thead><tr><th>Name</th><th>Prefix</th><th>RPS</th><th>Requests</th><th>Last used</th><th>Status</th><th></th></tr></thead>
+    <thead><tr><th>Username</th><th>App</th><th>Machine</th><th>Prefix</th><th>RPS</th><th>Requests</th><th>Last used</th><th>Status</th><th></th></tr></thead>
     <tbody>
     {{range .APIKeys}}
       <tr>
-        <td>{{.Name}}</td><td>{{.KeyPrefix}}…</td><td>{{printf "%.1f" .RateLimitRPS}}</td><td>{{.TotalRequests}}</td><td>{{timeago .LastUsedAt}}</td>
+        <td>{{.Username}}</td><td>{{.AppName}}</td><td>{{.MachineName}}</td><td>{{.KeyPrefix}}…</td><td>{{printf "%.1f" .RateLimitRPS}}</td><td>{{.TotalRequests}}</td><td>{{timeago .LastUsedAt}}</td>
         <td>{{if .Enabled}}<span class="healthy">active</span>{{else}}<span class="muted">revoked</span>{{end}}</td>
         <td>{{if .Enabled}}<form class="inline" action="/admin/keys/{{.ID}}/revoke" method="post"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button class="secondary">Revoke</button></form>{{end}}</td>
       </tr>
-    {{else}}<tr><td colspan="7" class="muted">No API keys yet.</td></tr>{{end}}
+    {{else}}<tr><td colspan="9" class="muted">No API keys yet.</td></tr>{{end}}
     </tbody>
   </table>
 
@@ -101,11 +111,11 @@
 
   <h2>Recent requests</h2>
   <table>
-    <thead><tr><th>When</th><th>Client</th><th>Token</th><th>Model</th><th>Status</th><th>Duration</th><th>Mode</th></tr></thead>
+    <thead><tr><th>When</th><th>Client</th><th>Token</th><th>Model</th><th>Status</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Duration</th><th>Mode</th></tr></thead>
     <tbody>
     {{range .Requests}}
-      <tr><td>{{timeago .CreatedAt}}</td><td>{{.Client}}</td><td>{{.Token}}</td><td>{{.Model}}</td><td>{{.StatusCode}}</td><td>{{.DurationMS}}ms</td><td>{{if .Streamed}}stream{{else}}buffered{{end}}</td></tr>
-    {{else}}<tr><td colspan="7" class="muted">No requests yet.</td></tr>{{end}}
+      <tr><td>{{timeago .CreatedAt}}</td><td>{{.Client}}</td><td>{{.Token}}</td><td>{{.Model}}</td><td>{{.StatusCode}}</td><td>{{.InputTokens}}</td><td>{{.OutputTokens}}</td><td>{{.TotalTokens}}</td><td>{{.DurationMS}}ms</td><td>{{if .Streamed}}stream{{else}}buffered{{end}}</td></tr>
+    {{else}}<tr><td colspan="10" class="muted">No requests yet.</td></tr>{{end}}
     </tbody>
   </table>
 </main>

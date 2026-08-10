@@ -76,8 +76,10 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) createKey(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Name         string  `json:"name"`
-		RateLimitRPS float64 `json:"rate_limit_rps"`
+		Username     string   `json:"username"`
+		AppName      string   `json:"app_name"`
+		MachineName  string   `json:"machine_name"`
+		RateLimitRPS *float64 `json:"rate_limit_rps"`
 	}
 	jsonRequest := isJSON(r)
 	if jsonRequest {
@@ -90,13 +92,23 @@ func (h *Handler) createKey(w http.ResponseWriter, r *http.Request) {
 			respondError(w, http.StatusForbidden, errors.New("invalid CSRF token"))
 			return
 		}
-		input.Name = r.FormValue("name")
-		input.RateLimitRPS, _ = strconv.ParseFloat(r.FormValue("rate_limit_rps"), 64)
+		input.Username = r.FormValue("username")
+		input.AppName = r.FormValue("app_name")
+		input.MachineName = r.FormValue("machine_name")
+		if value := strings.TrimSpace(r.FormValue("rate_limit_rps")); value != "" {
+			rate, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				respondError(w, http.StatusBadRequest, errors.New("rate_limit_rps must be a number"))
+				return
+			}
+			input.RateLimitRPS = &rate
+		}
 	}
-	if input.RateLimitRPS == 0 {
-		input.RateLimitRPS = 10
+	rateLimitRPS := 10.0
+	if input.RateLimitRPS != nil {
+		rateLimitRPS = *input.RateLimitRPS
 	}
-	created, err := h.store.CreateAPIKey(r.Context(), input.Name, input.RateLimitRPS)
+	created, err := h.store.CreateAPIKey(r.Context(), input.Username, input.AppName, input.MachineName, rateLimitRPS)
 	if err != nil {
 		if jsonRequest {
 			writeJSONError(w, http.StatusBadRequest, err.Error())

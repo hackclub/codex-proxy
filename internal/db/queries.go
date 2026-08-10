@@ -22,13 +22,19 @@ var (
 
 type APIKey struct {
 	ID            string     `json:"id"`
-	Name          string     `json:"name"`
+	Username      string     `json:"username"`
+	AppName       string     `json:"app_name"`
+	MachineName   string     `json:"machine_name"`
 	KeyPrefix     string     `json:"key_prefix"`
 	RateLimitRPS  float64    `json:"rate_limit_rps"`
 	Enabled       bool       `json:"enabled"`
 	CreatedAt     time.Time  `json:"created_at"`
 	LastUsedAt    *time.Time `json:"last_used_at"`
 	TotalRequests int64      `json:"total_requests"`
+}
+
+func (k APIKey) Label() string {
+	return k.Username + "/" + k.AppName + "/" + k.MachineName
 }
 
 type CreatedAPIKey struct {
@@ -60,39 +66,88 @@ type TokenSummary struct {
 }
 
 type RequestRecord struct {
-	APIKeyID     string
-	TokenID      string
-	Model        string
-	StatusCode   int
-	Duration     time.Duration
-	Streamed     bool
-	ErrorMessage string
+	APIKeyID                  string
+	TokenID                   string
+	Model                     string
+	StatusCode                int
+	Duration                  time.Duration
+	Streamed                  bool
+	ErrorMessage              string
+	ResponseID                string
+	UpstreamRequestID         string
+	ResponseModel             string
+	ResponseStatus            string
+	ServiceTier               string
+	InputTokens               int64
+	CachedTokens              int64
+	CacheWriteTokens          int64
+	OutputTokens              int64
+	ReasoningTokens           int64
+	TotalTokens               int64
+	WebSearchRequests         int64
+	ImageGenInputTokens       int64
+	ImageGenInputImageTokens  int64
+	ImageGenInputTextTokens   int64
+	ImageGenOutputTokens      int64
+	ImageGenOutputImageTokens int64
+	ImageGenOutputTextTokens  int64
+	ImageGenTotalTokens       int64
+	ResponseError             string
+	IncompleteDetails         string
+	CodexHeaders              string
 }
 
 type RecentRequest struct {
-	ID           int64     `json:"id"`
-	Client       string    `json:"client"`
-	Token        string    `json:"token"`
-	Model        string    `json:"model"`
-	StatusCode   int       `json:"status_code"`
-	DurationMS   int64     `json:"duration_ms"`
-	Streamed     bool      `json:"streamed"`
-	ErrorMessage string    `json:"error_message,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID                   int64     `json:"id"`
+	Client               string    `json:"client"`
+	Token                string    `json:"token"`
+	Model                string    `json:"model"`
+	StatusCode           int       `json:"status_code"`
+	DurationMS           int64     `json:"duration_ms"`
+	Streamed             bool      `json:"streamed"`
+	ErrorMessage         string    `json:"error_message,omitempty"`
+	ResponseID           string    `json:"response_id,omitempty"`
+	UpstreamRequestID    string    `json:"upstream_request_id,omitempty"`
+	ResponseModel        string    `json:"response_model,omitempty"`
+	ResponseStatus       string    `json:"response_status,omitempty"`
+	ServiceTier          string    `json:"service_tier,omitempty"`
+	InputTokens          int64     `json:"input_tokens"`
+	CachedTokens         int64     `json:"cached_tokens"`
+	CacheWriteTokens     int64     `json:"cache_write_tokens"`
+	OutputTokens         int64     `json:"output_tokens"`
+	ReasoningTokens      int64     `json:"reasoning_tokens"`
+	TotalTokens          int64     `json:"total_tokens"`
+	WebSearchRequests    int64     `json:"web_search_requests"`
+	ImageGenInputTokens  int64     `json:"image_gen_input_tokens"`
+	ImageGenOutputTokens int64     `json:"image_gen_output_tokens"`
+	ImageGenTotalTokens  int64     `json:"image_gen_total_tokens"`
+	CreatedAt            time.Time `json:"created_at"`
 }
 
 type Stats struct {
-	TotalRequests   int64 `json:"total_requests"`
-	TodayRequests   int64 `json:"today_requests"`
-	ActiveAPIKeys   int64 `json:"active_api_keys"`
-	HealthyTokens   int64 `json:"healthy_tokens"`
-	UnhealthyTokens int64 `json:"unhealthy_tokens"`
+	TotalRequests        int64 `json:"total_requests"`
+	TodayRequests        int64 `json:"today_requests"`
+	ActiveAPIKeys        int64 `json:"active_api_keys"`
+	HealthyTokens        int64 `json:"healthy_tokens"`
+	UnhealthyTokens      int64 `json:"unhealthy_tokens"`
+	InputTokens          int64 `json:"input_tokens"`
+	CachedTokens         int64 `json:"cached_tokens"`
+	CacheWriteTokens     int64 `json:"cache_write_tokens"`
+	OutputTokens         int64 `json:"output_tokens"`
+	ReasoningTokens      int64 `json:"reasoning_tokens"`
+	TotalTokens          int64 `json:"total_tokens"`
+	WebSearchRequests    int64 `json:"web_search_requests"`
+	ImageGenInputTokens  int64 `json:"image_gen_input_tokens"`
+	ImageGenOutputTokens int64 `json:"image_gen_output_tokens"`
+	ImageGenTotalTokens  int64 `json:"image_gen_total_tokens"`
 }
 
-func (s *Store) CreateAPIKey(ctx context.Context, name string, rateLimitRPS float64) (CreatedAPIKey, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return CreatedAPIKey{}, errors.New("API key name is required")
+func (s *Store) CreateAPIKey(ctx context.Context, username, appName, machineName string, rateLimitRPS float64) (CreatedAPIKey, error) {
+	username = strings.TrimSpace(username)
+	appName = strings.TrimSpace(appName)
+	machineName = strings.TrimSpace(machineName)
+	if username == "" || appName == "" || machineName == "" {
+		return CreatedAPIKey{}, errors.New("username, app_name, and machine_name are required")
 	}
 	if rateLimitRPS <= 0 {
 		return CreatedAPIKey{}, errors.New("rate limit must be positive")
@@ -110,11 +165,13 @@ func (s *Store) CreateAPIKey(ctx context.Context, name string, rateLimitRPS floa
 
 	created := CreatedAPIKey{Key: raw}
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO api_keys(name, key_hash, key_prefix, rate_limit_rps)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id::text, name, key_prefix, rate_limit_rps, enabled, created_at, last_used_at, total_requests
-	`, name, hash, prefix, rateLimitRPS).Scan(
-		&created.ID, &created.Name, &created.KeyPrefix, &created.RateLimitRPS, &created.Enabled,
+		INSERT INTO api_keys(username, app_name, machine_name, key_hash, key_prefix, rate_limit_rps)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id::text, username, app_name, machine_name, key_prefix, rate_limit_rps,
+			enabled, created_at, last_used_at, total_requests
+	`, username, appName, machineName, hash, prefix, rateLimitRPS).Scan(
+		&created.ID, &created.Username, &created.AppName, &created.MachineName,
+		&created.KeyPrefix, &created.RateLimitRPS, &created.Enabled,
 		&created.CreatedAt, &created.LastUsedAt, &created.TotalRequests,
 	)
 	if err != nil {
@@ -126,11 +183,13 @@ func (s *Store) CreateAPIKey(ctx context.Context, name string, rateLimitRPS floa
 func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (APIKey, error) {
 	var key APIKey
 	err := s.pool.QueryRow(ctx, `
-		SELECT id::text, name, key_prefix, rate_limit_rps, enabled, created_at, last_used_at, total_requests
+		SELECT id::text, username, app_name, machine_name, key_prefix, rate_limit_rps,
+			enabled, created_at, last_used_at, total_requests
 		FROM api_keys
 		WHERE key_hash = $1 AND enabled = true
 	`, hashAPIKey(strings.TrimSpace(raw))).Scan(
-		&key.ID, &key.Name, &key.KeyPrefix, &key.RateLimitRPS, &key.Enabled,
+		&key.ID, &key.Username, &key.AppName, &key.MachineName,
+		&key.KeyPrefix, &key.RateLimitRPS, &key.Enabled,
 		&key.CreatedAt, &key.LastUsedAt, &key.TotalRequests,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -144,7 +203,8 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (APIKey, err
 
 func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id::text, name, key_prefix, rate_limit_rps, enabled, created_at, last_used_at, total_requests
+		SELECT id::text, username, app_name, machine_name, key_prefix, rate_limit_rps,
+			enabled, created_at, last_used_at, total_requests
 		FROM api_keys ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -155,7 +215,10 @@ func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 	keys := make([]APIKey, 0)
 	for rows.Next() {
 		var key APIKey
-		if err := rows.Scan(&key.ID, &key.Name, &key.KeyPrefix, &key.RateLimitRPS, &key.Enabled, &key.CreatedAt, &key.LastUsedAt, &key.TotalRequests); err != nil {
+		if err := rows.Scan(
+			&key.ID, &key.Username, &key.AppName, &key.MachineName, &key.KeyPrefix,
+			&key.RateLimitRPS, &key.Enabled, &key.CreatedAt, &key.LastUsedAt, &key.TotalRequests,
+		); err != nil {
 			return nil, fmt.Errorf("scan API key: %w", err)
 		}
 		keys = append(keys, key)
@@ -365,11 +428,31 @@ func (s *Store) RecordRequest(ctx context.Context, record RequestRecord) error {
 	}
 	_, err := s.pool.Exec(ctx, `
 		WITH inserted AS (
-			INSERT INTO requests(api_key_id, token_id, model, status_code, duration_ms, streamed, error_message)
-			VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''))
+			INSERT INTO requests(
+				api_key_id, token_id, model, status_code, duration_ms, streamed, error_message,
+				response_id, upstream_request_id, response_model, response_status, service_tier,
+				input_tokens, cached_tokens, cache_write_tokens, output_tokens, reasoning_tokens, total_tokens,
+				web_search_requests, image_gen_input_tokens, image_gen_input_image_tokens,
+				image_gen_input_text_tokens, image_gen_output_tokens, image_gen_output_image_tokens,
+				image_gen_output_text_tokens, image_gen_total_tokens,
+				response_error, incomplete_details, codex_headers
+			)
+			VALUES (
+				$1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''),
+				NULLIF($8, ''), NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''), NULLIF($12, ''),
+				$13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26,
+				NULLIF($27, '')::jsonb, NULLIF($28, '')::jsonb, NULLIF($29, '')::jsonb
+			)
 		)
 		UPDATE api_keys SET last_used_at = now(), total_requests = total_requests + 1 WHERE id = $1
-	`, apiKeyID, tokenID, record.Model, record.StatusCode, record.Duration.Milliseconds(), record.Streamed, record.ErrorMessage)
+	`, apiKeyID, tokenID, record.Model, record.StatusCode, record.Duration.Milliseconds(), record.Streamed,
+		record.ErrorMessage, record.ResponseID, record.UpstreamRequestID, record.ResponseModel,
+		record.ResponseStatus, record.ServiceTier, record.InputTokens, record.CachedTokens,
+		record.CacheWriteTokens, record.OutputTokens, record.ReasoningTokens, record.TotalTokens,
+		record.WebSearchRequests, record.ImageGenInputTokens, record.ImageGenInputImageTokens,
+		record.ImageGenInputTextTokens, record.ImageGenOutputTokens, record.ImageGenOutputImageTokens,
+		record.ImageGenOutputTextTokens, record.ImageGenTotalTokens, record.ResponseError,
+		record.IncompleteDetails, record.CodexHeaders)
 	if err != nil {
 		return fmt.Errorf("record request: %w", err)
 	}
@@ -381,8 +464,14 @@ func (s *Store) RecentRequests(ctx context.Context, limit int) ([]RecentRequest,
 		limit = 100
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT r.id, COALESCE(k.name, ''), COALESCE(t.label, ''), COALESCE(r.model, ''),
-			r.status_code, r.duration_ms, r.streamed, COALESCE(r.error_message, ''), r.created_at
+		SELECT r.id, COALESCE(k.username || '/' || k.app_name || '/' || k.machine_name, ''),
+			COALESCE(t.label, ''), COALESCE(r.model, ''),
+			r.status_code, r.duration_ms, r.streamed, COALESCE(r.error_message, ''),
+			COALESCE(r.response_id, ''), COALESCE(r.upstream_request_id, ''),
+			COALESCE(r.response_model, ''), COALESCE(r.response_status, ''), COALESCE(r.service_tier, ''),
+			r.input_tokens, r.cached_tokens, r.cache_write_tokens, r.output_tokens,
+			r.reasoning_tokens, r.total_tokens, r.web_search_requests,
+			r.image_gen_input_tokens, r.image_gen_output_tokens, r.image_gen_total_tokens, r.created_at
 		FROM requests r
 		LEFT JOIN api_keys k ON k.id = r.api_key_id
 		LEFT JOIN tokens t ON t.id = r.token_id
@@ -396,7 +485,15 @@ func (s *Store) RecentRequests(ctx context.Context, limit int) ([]RecentRequest,
 	requests := make([]RecentRequest, 0)
 	for rows.Next() {
 		var request RecentRequest
-		if err := rows.Scan(&request.ID, &request.Client, &request.Token, &request.Model, &request.StatusCode, &request.DurationMS, &request.Streamed, &request.ErrorMessage, &request.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&request.ID, &request.Client, &request.Token, &request.Model, &request.StatusCode,
+			&request.DurationMS, &request.Streamed, &request.ErrorMessage, &request.ResponseID,
+			&request.UpstreamRequestID, &request.ResponseModel, &request.ResponseStatus,
+			&request.ServiceTier, &request.InputTokens, &request.CachedTokens,
+			&request.CacheWriteTokens, &request.OutputTokens, &request.ReasoningTokens,
+			&request.TotalTokens, &request.WebSearchRequests, &request.ImageGenInputTokens,
+			&request.ImageGenOutputTokens, &request.ImageGenTotalTokens, &request.CreatedAt,
+		); err != nil {
 			return nil, fmt.Errorf("scan recent request: %w", err)
 		}
 		requests = append(requests, request)
@@ -412,8 +509,24 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM requests WHERE created_at >= date_trunc('day', now())),
 			(SELECT count(*) FROM api_keys WHERE enabled = true),
 			(SELECT count(*) FROM tokens WHERE enabled = true AND healthy = true),
-			(SELECT count(*) FROM tokens WHERE enabled = true AND healthy = false)
-	`).Scan(&stats.TotalRequests, &stats.TodayRequests, &stats.ActiveAPIKeys, &stats.HealthyTokens, &stats.UnhealthyTokens)
+			(SELECT count(*) FROM tokens WHERE enabled = true AND healthy = false),
+			COALESCE((SELECT sum(input_tokens) FROM requests), 0),
+			COALESCE((SELECT sum(cached_tokens) FROM requests), 0),
+			COALESCE((SELECT sum(cache_write_tokens) FROM requests), 0),
+			COALESCE((SELECT sum(output_tokens) FROM requests), 0),
+			COALESCE((SELECT sum(reasoning_tokens) FROM requests), 0),
+			COALESCE((SELECT sum(total_tokens) FROM requests), 0),
+			COALESCE((SELECT sum(web_search_requests) FROM requests), 0),
+			COALESCE((SELECT sum(image_gen_input_tokens) FROM requests), 0),
+			COALESCE((SELECT sum(image_gen_output_tokens) FROM requests), 0),
+			COALESCE((SELECT sum(image_gen_total_tokens) FROM requests), 0)
+	`).Scan(
+		&stats.TotalRequests, &stats.TodayRequests, &stats.ActiveAPIKeys,
+		&stats.HealthyTokens, &stats.UnhealthyTokens, &stats.InputTokens,
+		&stats.CachedTokens, &stats.CacheWriteTokens, &stats.OutputTokens,
+		&stats.ReasoningTokens, &stats.TotalTokens, &stats.WebSearchRequests,
+		&stats.ImageGenInputTokens, &stats.ImageGenOutputTokens, &stats.ImageGenTotalTokens,
+	)
 	if err != nil {
 		return Stats{}, fmt.Errorf("load stats: %w", err)
 	}
