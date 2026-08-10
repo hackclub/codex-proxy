@@ -1,0 +1,9 @@
+.mcp.json
+HANDOFF.md
+.env
+.DS_Store
+/bin/
+/codex-proxy
+/tmp/
+!internal/db/migrations/
+!internal/db/migrations/*.sql

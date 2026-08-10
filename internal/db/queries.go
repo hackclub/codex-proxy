@@ -1,0 +1,434 @@
+package db
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+var (
+	ErrInvalidAPIKey   = errors.New("invalid API key")
+	ErrNoHealthyTokens = errors.New("no healthy tokens available")
+	ErrNotFound        = errors.New("not found")
+)
+
+type APIKey struct {
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	KeyPrefix     string     `json:"key_prefix"`
+	RateLimitRPS  float64    `json:"rate_limit_rps"`
+	Enabled       bool       `json:"enabled"`
+	CreatedAt     time.Time  `json:"created_at"`
+	LastUsedAt    *time.Time `json:"last_used_at"`
+	TotalRequests int64      `json:"total_requests"`
+}
+
+type CreatedAPIKey struct {
+	APIKey
+	Key string `json:"key"`
+}
+
+type Token struct {
+	ID                   string
+	Label                string
+	AccountID            string
+	AccessToken          string
+	RefreshToken         string
+	AccessTokenExpiresAt time.Time
+}
+
+type TokenSummary struct {
+	ID                   string     `json:"id"`
+	Label                string     `json:"label"`
+	AccountID            string     `json:"account_id"`
+	AccessTokenExpiresAt time.Time  `json:"access_token_expires_at"`
+	Healthy              bool       `json:"healthy"`
+	ConsecutiveFailures  int        `json:"consecutive_failures"`
+	ErrorMessage         string     `json:"error_message,omitempty"`
+	Enabled              bool       `json:"enabled"`
+	CreatedAt            time.Time  `json:"created_at"`
+	LastUsedAt           *time.Time `json:"last_used_at"`
+	LastRefreshedAt      time.Time  `json:"last_refreshed_at"`
+}
+
+type RequestRecord struct {
+	APIKeyID     string
+	TokenID      string
+	Model        string
+	StatusCode   int
+	Duration     time.Duration
+	Streamed     bool
+	ErrorMessage string
+}
+
+type RecentRequest struct {
+	ID           int64     `json:"id"`
+	Client       string    `json:"client"`
+	Token        string    `json:"token"`
+	Model        string    `json:"model"`
+	StatusCode   int       `json:"status_code"`
+	DurationMS   int64     `json:"duration_ms"`
+	Streamed     bool      `json:"streamed"`
+	ErrorMessage string    `json:"error_message,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type Stats struct {
+	TotalRequests   int64 `json:"total_requests"`
+	TodayRequests   int64 `json:"today_requests"`
+	ActiveAPIKeys   int64 `json:"active_api_keys"`
+	HealthyTokens   int64 `json:"healthy_tokens"`
+	UnhealthyTokens int64 `json:"unhealthy_tokens"`
+}
+
+func (s *Store) CreateAPIKey(ctx context.Context, name string, rateLimitRPS float64) (CreatedAPIKey, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return CreatedAPIKey{}, errors.New("API key name is required")
+	}
+	if rateLimitRPS <= 0 {
+		return CreatedAPIKey{}, errors.New("rate limit must be positive")
+	}
+	random := make([]byte, 32)
+	if _, err := rand.Read(random); err != nil {
+		return CreatedAPIKey{}, fmt.Errorf("generate API key: %w", err)
+	}
+	raw := "cp_" + base64.RawURLEncoding.EncodeToString(random)
+	prefix := raw
+	if len(prefix) > 12 {
+		prefix = prefix[:12]
+	}
+	hash := hashAPIKey(raw)
+
+	created := CreatedAPIKey{Key: raw}
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO api_keys(name, key_hash, key_prefix, rate_limit_rps)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id::text, name, key_prefix, rate_limit_rps, enabled, created_at, last_used_at, total_requests
+	`, name, hash, prefix, rateLimitRPS).Scan(
+		&created.ID, &created.Name, &created.KeyPrefix, &created.RateLimitRPS, &created.Enabled,
+		&created.CreatedAt, &created.LastUsedAt, &created.TotalRequests,
+	)
+	if err != nil {
+		return CreatedAPIKey{}, fmt.Errorf("insert API key: %w", err)
+	}
+	return created, nil
+}
+
+func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (APIKey, error) {
+	var key APIKey
+	err := s.pool.QueryRow(ctx, `
+		SELECT id::text, name, key_prefix, rate_limit_rps, enabled, created_at, last_used_at, total_requests
+		FROM api_keys
+		WHERE key_hash = $1 AND enabled = true
+	`, hashAPIKey(strings.TrimSpace(raw))).Scan(
+		&key.ID, &key.Name, &key.KeyPrefix, &key.RateLimitRPS, &key.Enabled,
+		&key.CreatedAt, &key.LastUsedAt, &key.TotalRequests,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return APIKey{}, ErrInvalidAPIKey
+	}
+	if err != nil {
+		return APIKey{}, fmt.Errorf("authenticate API key: %w", err)
+	}
+	return key, nil
+}
+
+func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id::text, name, key_prefix, rate_limit_rps, enabled, created_at, last_used_at, total_requests
+		FROM api_keys ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list API keys: %w", err)
+	}
+	defer rows.Close()
+
+	keys := make([]APIKey, 0)
+	for rows.Next() {
+		var key APIKey
+		if err := rows.Scan(&key.ID, &key.Name, &key.KeyPrefix, &key.RateLimitRPS, &key.Enabled, &key.CreatedAt, &key.LastUsedAt, &key.TotalRequests); err != nil {
+			return nil, fmt.Errorf("scan API key: %w", err)
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
+func (s *Store) RevokeAPIKey(ctx context.Context, id string) error {
+	result, err := s.pool.Exec(ctx, `UPDATE api_keys SET enabled = false WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("revoke API key: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) UpsertToken(ctx context.Context, token Token) (TokenSummary, error) {
+	accessCiphertext, err := s.box.Encrypt(token.AccessToken)
+	if err != nil {
+		return TokenSummary{}, fmt.Errorf("encrypt access token: %w", err)
+	}
+	refreshCiphertext, err := s.box.Encrypt(token.RefreshToken)
+	if err != nil {
+		return TokenSummary{}, fmt.Errorf("encrypt refresh token: %w", err)
+	}
+
+	var summary TokenSummary
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO tokens(label, account_id, access_token_ciphertext, refresh_token_ciphertext, access_token_expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (label) DO UPDATE SET
+			account_id = EXCLUDED.account_id,
+			access_token_ciphertext = EXCLUDED.access_token_ciphertext,
+			refresh_token_ciphertext = EXCLUDED.refresh_token_ciphertext,
+			access_token_expires_at = EXCLUDED.access_token_expires_at,
+			healthy = true,
+			consecutive_failures = 0,
+			error_message = NULL,
+			enabled = true,
+			last_refreshed_at = now()
+		RETURNING id::text, label, account_id, access_token_expires_at, healthy,
+			consecutive_failures, COALESCE(error_message, ''), enabled, created_at, last_used_at, last_refreshed_at
+	`, token.Label, token.AccountID, accessCiphertext, refreshCiphertext, token.AccessTokenExpiresAt).Scan(
+		&summary.ID, &summary.Label, &summary.AccountID, &summary.AccessTokenExpiresAt, &summary.Healthy,
+		&summary.ConsecutiveFailures, &summary.ErrorMessage, &summary.Enabled, &summary.CreatedAt,
+		&summary.LastUsedAt, &summary.LastRefreshedAt,
+	)
+	if err != nil {
+		return TokenSummary{}, fmt.Errorf("upsert token: %w", err)
+	}
+	return summary, nil
+}
+
+func (s *Store) SelectToken(ctx context.Context) (Token, error) {
+	return s.queryToken(ctx, `
+		WITH selected AS (
+			SELECT id FROM tokens
+			WHERE enabled = true AND healthy = true
+			ORDER BY last_used_at ASC NULLS FIRST, created_at ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		UPDATE tokens SET last_used_at = now()
+		WHERE id = (SELECT id FROM selected)
+		RETURNING id::text, label, account_id, access_token_ciphertext,
+			refresh_token_ciphertext, access_token_expires_at
+	`)
+}
+
+func (s *Store) GetToken(ctx context.Context, id string) (Token, error) {
+	return s.queryToken(ctx, `
+		SELECT id::text, label, account_id, access_token_ciphertext,
+			refresh_token_ciphertext, access_token_expires_at
+		FROM tokens WHERE id = $1 AND enabled = true AND healthy = true
+	`, id)
+}
+
+func (s *Store) queryToken(ctx context.Context, query string, args ...any) (Token, error) {
+	var token Token
+	var accessCiphertext, refreshCiphertext string
+	err := s.pool.QueryRow(ctx, query, args...).Scan(
+		&token.ID, &token.Label, &token.AccountID, &accessCiphertext,
+		&refreshCiphertext, &token.AccessTokenExpiresAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Token{}, ErrNoHealthyTokens
+	}
+	if err != nil {
+		return Token{}, fmt.Errorf("select token: %w", err)
+	}
+	token.AccessToken, err = s.box.Decrypt(accessCiphertext)
+	if err != nil {
+		return Token{}, fmt.Errorf("decrypt access token for %s: %w", token.ID, err)
+	}
+	token.RefreshToken, err = s.box.Decrypt(refreshCiphertext)
+	if err != nil {
+		return Token{}, fmt.Errorf("decrypt refresh token for %s: %w", token.ID, err)
+	}
+	return token, nil
+}
+
+func (s *Store) UpdateTokenCredentials(ctx context.Context, token Token) error {
+	accessCiphertext, err := s.box.Encrypt(token.AccessToken)
+	if err != nil {
+		return fmt.Errorf("encrypt access token: %w", err)
+	}
+	refreshCiphertext, err := s.box.Encrypt(token.RefreshToken)
+	if err != nil {
+		return fmt.Errorf("encrypt refresh token: %w", err)
+	}
+	result, err := s.pool.Exec(ctx, `
+		UPDATE tokens SET account_id = $2, access_token_ciphertext = $3,
+			refresh_token_ciphertext = $4, access_token_expires_at = $5,
+			healthy = true, consecutive_failures = 0, error_message = NULL,
+			last_refreshed_at = now()
+		WHERE id = $1
+	`, token.ID, token.AccountID, accessCiphertext, refreshCiphertext, token.AccessTokenExpiresAt)
+	if err != nil {
+		return fmt.Errorf("update token credentials: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) RecordTokenFailure(ctx context.Context, id, message string, threshold int) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE tokens SET
+			consecutive_failures = consecutive_failures + 1,
+			error_message = $2,
+			healthy = CASE WHEN consecutive_failures + 1 >= $3 THEN false ELSE healthy END
+		WHERE id = $1
+	`, id, message, threshold)
+	if err != nil {
+		return fmt.Errorf("record token failure: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) MarkTokenUnhealthy(ctx context.Context, id, message string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE tokens SET healthy = false, consecutive_failures = consecutive_failures + 1, error_message = $2
+		WHERE id = $1
+	`, id, message)
+	if err != nil {
+		return fmt.Errorf("mark token unhealthy: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListTokens(ctx context.Context) ([]TokenSummary, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id::text, label, account_id, access_token_expires_at, healthy,
+			consecutive_failures, COALESCE(error_message, ''), enabled, created_at,
+			last_used_at, last_refreshed_at
+		FROM tokens ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list tokens: %w", err)
+	}
+	defer rows.Close()
+
+	tokens := make([]TokenSummary, 0)
+	for rows.Next() {
+		var token TokenSummary
+		if err := rows.Scan(
+			&token.ID, &token.Label, &token.AccountID, &token.AccessTokenExpiresAt,
+			&token.Healthy, &token.ConsecutiveFailures, &token.ErrorMessage, &token.Enabled,
+			&token.CreatedAt, &token.LastUsedAt, &token.LastRefreshedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan token: %w", err)
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens, rows.Err()
+}
+
+func (s *Store) DisableToken(ctx context.Context, id string) error {
+	result, err := s.pool.Exec(ctx, `UPDATE tokens SET enabled = false WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("disable token: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) HealthyTokenCount(ctx context.Context) (int64, error) {
+	var count int64
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM tokens WHERE enabled = true AND healthy = true`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count healthy tokens: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) RecordRequest(ctx context.Context, record RequestRecord) error {
+	var apiKeyID, tokenID any
+	if record.APIKeyID != "" {
+		apiKeyID = record.APIKeyID
+	}
+	if record.TokenID != "" {
+		tokenID = record.TokenID
+	}
+	_, err := s.pool.Exec(ctx, `
+		WITH inserted AS (
+			INSERT INTO requests(api_key_id, token_id, model, status_code, duration_ms, streamed, error_message)
+			VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''))
+		)
+		UPDATE api_keys SET last_used_at = now(), total_requests = total_requests + 1 WHERE id = $1
+	`, apiKeyID, tokenID, record.Model, record.StatusCode, record.Duration.Milliseconds(), record.Streamed, record.ErrorMessage)
+	if err != nil {
+		return fmt.Errorf("record request: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) RecentRequests(ctx context.Context, limit int) ([]RecentRequest, error) {
+	if limit < 1 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT r.id, COALESCE(k.name, ''), COALESCE(t.label, ''), COALESCE(r.model, ''),
+			r.status_code, r.duration_ms, r.streamed, COALESCE(r.error_message, ''), r.created_at
+		FROM requests r
+		LEFT JOIN api_keys k ON k.id = r.api_key_id
+		LEFT JOIN tokens t ON t.id = r.token_id
+		ORDER BY r.id DESC LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list recent requests: %w", err)
+	}
+	defer rows.Close()
+
+	requests := make([]RecentRequest, 0)
+	for rows.Next() {
+		var request RecentRequest
+		if err := rows.Scan(&request.ID, &request.Client, &request.Token, &request.Model, &request.StatusCode, &request.DurationMS, &request.Streamed, &request.ErrorMessage, &request.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan recent request: %w", err)
+		}
+		requests = append(requests, request)
+	}
+	return requests, rows.Err()
+}
+
+func (s *Store) Stats(ctx context.Context) (Stats, error) {
+	var stats Stats
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM requests),
+			(SELECT count(*) FROM requests WHERE created_at >= date_trunc('day', now())),
+			(SELECT count(*) FROM api_keys WHERE enabled = true),
+			(SELECT count(*) FROM tokens WHERE enabled = true AND healthy = true),
+			(SELECT count(*) FROM tokens WHERE enabled = true AND healthy = false)
+	`).Scan(&stats.TotalRequests, &stats.TodayRequests, &stats.ActiveAPIKeys, &stats.HealthyTokens, &stats.UnhealthyTokens)
+	if err != nil {
+		return Stats{}, fmt.Errorf("load stats: %w", err)
+	}
+	return stats, nil
+}
+
+func (s *Store) CleanupRequests(ctx context.Context, olderThan time.Time) (int64, error) {
+	result, err := s.pool.Exec(ctx, `DELETE FROM requests WHERE created_at < $1`, olderThan)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup requests: %w", err)
+	}
+	return result.RowsAffected(), nil
+}
+
+func hashAPIKey(raw string) string {
+	hash := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(hash[:])
+}

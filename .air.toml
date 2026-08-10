@@ -1,0 +1,14 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -o ./tmp/codex-proxy ./cmd/server"
+bin = "./tmp/codex-proxy"
+include_ext = ["go", "html", "sql"]
+exclude_dir = ["tmp", ".git"]
+delay = 300
+stop_on_error = true
+
+[log]
+time = true
+

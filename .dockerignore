@@ -1,0 +1,8 @@
+.git
+.env
+.mcp.json
+HANDOFF.md
+bin
+tmp
+codex-proxy
+

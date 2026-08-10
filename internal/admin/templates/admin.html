@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>codex-proxy admin</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0d1117; color: #e6edf3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 32px 20px 64px; }
+    main { width: min(1180px, 100%); margin: 0 auto; }
+    h1, h2 { letter-spacing: -0.04em; }
+    h1 { color: #ec3750; margin-bottom: 4px; }
+    h2 { margin-top: 40px; }
+    .muted { color: #8b949e; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 24px 0; }
+    .card, form, .notice, .error { border: 1px solid #30363d; border-radius: 10px; background: #161b22; padding: 16px; }
+    .metric { font-size: 30px; font-weight: 700; margin-top: 6px; }
+    .forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 16px; }
+    label { display: block; color: #8b949e; font-size: 13px; margin: 12px 0 5px; }
+    input { width: 100%; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; color: #e6edf3; padding: 9px 10px; font: inherit; }
+    button { margin-top: 14px; border: 0; border-radius: 6px; background: #ec3750; color: white; padding: 9px 13px; font: inherit; font-weight: 700; cursor: pointer; }
+    button.secondary { margin: 0; background: #30363d; }
+    table { width: 100%; border-collapse: collapse; display: block; overflow-x: auto; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #21262d; white-space: nowrap; }
+    th { color: #8b949e; font-size: 12px; text-transform: uppercase; }
+    .healthy { color: #3fb950; }
+    .unhealthy { color: #f85149; }
+    .notice { border-color: #2ea043; margin: 18px 0; }
+    .error { border-color: #f85149; margin: 18px 0; }
+    pre { overflow-wrap: anywhere; white-space: pre-wrap; color: #79c0ff; }
+    .inline { display: inline; border: 0; padding: 0; background: transparent; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>codex-proxy</h1>
+  <div class="muted">subscription-backed Responses API control plane</div>
+
+  {{if .Notice}}<div class="notice">{{.Notice}}</div>{{end}}
+  {{if .CreatedKey}}<div class="notice"><strong>Copy this key now:</strong><pre>{{.CreatedKey}}</pre></div>{{end}}
+
+  <section class="grid">
+    <div class="card"><div class="muted">Total requests</div><div class="metric">{{.Stats.TotalRequests}}</div></div>
+    <div class="card"><div class="muted">Today</div><div class="metric">{{.Stats.TodayRequests}}</div></div>
+    <div class="card"><div class="muted">Active clients</div><div class="metric">{{.Stats.ActiveAPIKeys}}</div></div>
+    <div class="card"><div class="muted">Healthy tokens</div><div class="metric">{{.Stats.HealthyTokens}}</div></div>
+  </section>
+
+  <section class="forms">
+    <form action="/admin/keys" method="post">
+      <h2>Create API key</h2>
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <label for="key-name">Name</label>
+      <input id="key-name" name="name" placeholder="big-mac-prod" required>
+      <label for="rate">Requests per second</label>
+      <input id="rate" name="rate_limit_rps" type="number" min="0.1" step="0.1" value="10" required>
+      <button type="submit">Create key</button>
+    </form>
+
+    <form action="/admin/tokens" method="post">
+      <h2>Add or replace token</h2>
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <label for="label">Label</label>
+      <input id="label" name="label" placeholder="max-plus" required>
+      <label for="refresh-token">Refresh token</label>
+      <input id="refresh-token" name="refresh_token" type="password" autocomplete="off" required>
+      <label for="account-id">Account ID (optional if token contains it)</label>
+      <input id="account-id" name="account_id" placeholder="acct_…">
+      <button type="submit">Refresh and encrypt token</button>
+    </form>
+  </section>
+
+  <h2>API keys</h2>
+  <table>
+    <thead><tr><th>Name</th><th>Prefix</th><th>RPS</th><th>Requests</th><th>Last used</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+    {{range .APIKeys}}
+      <tr>
+        <td>{{.Name}}</td><td>{{.KeyPrefix}}…</td><td>{{printf "%.1f" .RateLimitRPS}}</td><td>{{.TotalRequests}}</td><td>{{timeago .LastUsedAt}}</td>
+        <td>{{if .Enabled}}<span class="healthy">active</span>{{else}}<span class="muted">revoked</span>{{end}}</td>
+        <td>{{if .Enabled}}<form class="inline" action="/admin/keys/{{.ID}}/revoke" method="post"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button class="secondary">Revoke</button></form>{{end}}</td>
+      </tr>
+    {{else}}<tr><td colspan="7" class="muted">No API keys yet.</td></tr>{{end}}
+    </tbody>
+  </table>
+
+  <h2>Token pool</h2>
+  <table>
+    <thead><tr><th>Label</th><th>Account</th><th>Expires</th><th>Last refresh</th><th>Failures</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+    {{range .Tokens}}
+      <tr>
+        <td>{{.Label}}</td><td>{{.AccountID}}</td><td>{{.AccessTokenExpiresAt.Format "2006-01-02 15:04 MST"}}</td><td>{{timeago .LastRefreshedAt}}</td><td>{{.ConsecutiveFailures}}</td>
+        <td>{{if and .Enabled .Healthy}}<span class="healthy">healthy</span>{{else if not .Enabled}}<span class="muted">removed</span>{{else}}<span class="unhealthy" title="{{.ErrorMessage}}">unhealthy</span>{{end}}</td>
+        <td>{{if .Enabled}}<form class="inline" action="/admin/tokens/{{.ID}}/remove" method="post"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button class="secondary">Remove</button></form>{{end}}</td>
+      </tr>
+    {{else}}<tr><td colspan="7" class="muted">No donated tokens yet.</td></tr>{{end}}
+    </tbody>
+  </table>
+
+  <h2>Recent requests</h2>
+  <table>
+    <thead><tr><th>When</th><th>Client</th><th>Token</th><th>Model</th><th>Status</th><th>Duration</th><th>Mode</th></tr></thead>
+    <tbody>
+    {{range .Requests}}
+      <tr><td>{{timeago .CreatedAt}}</td><td>{{.Client}}</td><td>{{.Token}}</td><td>{{.Model}}</td><td>{{.StatusCode}}</td><td>{{.DurationMS}}ms</td><td>{{if .Streamed}}stream{{else}}buffered{{end}}</td></tr>
+    {{else}}<tr><td colspan="7" class="muted">No requests yet.</td></tr>{{end}}
+    </tbody>
+  </table>
+</main>
+</body>
+</html>
