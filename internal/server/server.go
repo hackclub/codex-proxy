@@ -53,7 +53,7 @@ func (a *App) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if count == 0 {
-		writeHealth(w, http.StatusServiceUnavailable, false, 0, "no healthy tokens")
+		writeHealth(w, http.StatusServiceUnavailable, false, 0, "no available tokens")
 		return
 	}
 	writeHealth(w, http.StatusOK, true, count, "")

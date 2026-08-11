@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -144,6 +145,101 @@ func (m *Manager) ReportAuthFailure(ctx context.Context, tokenID, message string
 	if tokenID != "" {
 		_ = m.store.MarkTokenUnhealthy(ctx, tokenID, message)
 	}
+}
+
+func (m *Manager) ReportUsage(ctx context.Context, tokenID string, headers http.Header) error {
+	if tokenID == "" {
+		return nil
+	}
+	return m.store.UpdateTokenQuota(ctx, tokenID, quotaFromHeaders(headers))
+}
+
+func (m *Manager) ReportRateLimit(ctx context.Context, tokenID string, headers http.Header, body []byte) (time.Time, error) {
+	quota := quotaFromHeaders(headers)
+	limitedUntil, reason := rateLimit(headers, body, time.Now())
+	quota.LimitedUntil = &limitedUntil
+	quota.LimitReason = reason
+	if tokenID == "" {
+		return limitedUntil, nil
+	}
+	return limitedUntil, m.store.UpdateTokenQuota(ctx, tokenID, quota)
+}
+
+func quotaFromHeaders(headers http.Header) db.TokenQuota {
+	return db.TokenQuota{
+		PlanType:             headers.Get("X-Codex-Plan-Type"),
+		ActiveLimit:          headers.Get("X-Codex-Active-Limit"),
+		PrimaryUsedPercent:   floatHeader(headers, "X-Codex-Primary-Used-Percent"),
+		PrimaryResetAt:       timeHeader(headers, "X-Codex-Primary-Reset-At"),
+		SecondaryUsedPercent: floatHeader(headers, "X-Codex-Secondary-Used-Percent"),
+		SecondaryResetAt:     timeHeader(headers, "X-Codex-Secondary-Reset-At"),
+	}
+}
+
+func rateLimit(headers http.Header, body []byte, now time.Time) (time.Time, string) {
+	type limitResponse struct {
+		Type     string         `json:"type"`
+		ResetsAt int64          `json:"resets_at"`
+		Error    *limitResponse `json:"error"`
+	}
+	var response limitResponse
+	_ = json.Unmarshal(body, &response)
+	if response.Error != nil {
+		response = *response.Error
+	}
+
+	if response.Type == "usage_limit_reached" {
+		if reset := time.Unix(response.ResetsAt, 0); response.ResetsAt > 0 && reset.After(now) {
+			return reset, response.Type
+		}
+		quota := quotaFromHeaders(headers)
+		var reset time.Time
+		for _, window := range []struct {
+			used *float64
+			at   *time.Time
+		}{{quota.PrimaryUsedPercent, quota.PrimaryResetAt}, {quota.SecondaryUsedPercent, quota.SecondaryResetAt}} {
+			if window.used != nil && *window.used >= 100 && window.at != nil && window.at.After(reset) {
+				reset = *window.at
+			}
+		}
+		if reset.After(now) {
+			return reset, response.Type
+		}
+	}
+
+	reason := response.Type
+	if reason == "" {
+		reason = "rate_limited"
+	}
+	if retryAt := retryAfter(headers.Get("Retry-After"), now); retryAt.After(now) {
+		return retryAt, reason
+	}
+	return now.Add(time.Minute), reason
+}
+
+func floatHeader(headers http.Header, name string) *float64 {
+	value, err := strconv.ParseFloat(headers.Get(name), 64)
+	if err != nil {
+		return nil
+	}
+	return &value
+}
+
+func timeHeader(headers http.Header, name string) *time.Time {
+	seconds, err := strconv.ParseInt(headers.Get(name), 10, 64)
+	if err != nil || seconds <= 0 {
+		return nil
+	}
+	value := time.Unix(seconds, 0)
+	return &value
+}
+
+func retryAfter(value string, now time.Time) time.Time {
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return now.Add(time.Duration(seconds) * time.Second)
+	}
+	when, _ := http.ParseTime(value)
+	return when
 }
 
 func (m *Manager) needsRefresh(token db.Token) bool {

@@ -15,10 +15,22 @@ import (
 )
 
 var (
-	ErrInvalidAPIKey   = errors.New("invalid API key")
-	ErrNoHealthyTokens = errors.New("no healthy tokens available")
-	ErrNotFound        = errors.New("not found")
+	ErrInvalidAPIKey     = errors.New("invalid API key")
+	ErrNoAvailableTokens = errors.New("no tokens available")
+	ErrNotFound          = errors.New("not found")
 )
+
+type NoAvailableTokensError struct {
+	RetryAt *time.Time
+}
+
+func (e *NoAvailableTokensError) Error() string {
+	return ErrNoAvailableTokens.Error()
+}
+
+func (e *NoAvailableTokensError) Unwrap() error {
+	return ErrNoAvailableTokens
+}
 
 type APIKey struct {
 	ID            string     `json:"id"`
@@ -31,6 +43,9 @@ type APIKey struct {
 	CreatedAt     time.Time  `json:"created_at"`
 	LastUsedAt    *time.Time `json:"last_used_at"`
 	TotalRequests int64      `json:"total_requests"`
+	InputTokens   int64      `json:"input_tokens"`
+	OutputTokens  int64      `json:"output_tokens"`
+	TotalTokens   int64      `json:"total_tokens"`
 }
 
 func (k APIKey) Label() string {
@@ -63,6 +78,25 @@ type TokenSummary struct {
 	CreatedAt            time.Time  `json:"created_at"`
 	LastUsedAt           *time.Time `json:"last_used_at"`
 	LastRefreshedAt      time.Time  `json:"last_refreshed_at"`
+	PlanType             string     `json:"plan_type,omitempty"`
+	ActiveLimit          string     `json:"active_limit,omitempty"`
+	PrimaryUsedPercent   *float64   `json:"primary_used_percent,omitempty"`
+	PrimaryResetAt       *time.Time `json:"primary_reset_at,omitempty"`
+	SecondaryUsedPercent *float64   `json:"secondary_used_percent,omitempty"`
+	SecondaryResetAt     *time.Time `json:"secondary_reset_at,omitempty"`
+	LimitedUntil         *time.Time `json:"limited_until,omitempty"`
+	LimitReason          string     `json:"limit_reason,omitempty"`
+}
+
+type TokenQuota struct {
+	PlanType             string
+	ActiveLimit          string
+	PrimaryUsedPercent   *float64
+	PrimaryResetAt       *time.Time
+	SecondaryUsedPercent *float64
+	SecondaryResetAt     *time.Time
+	LimitedUntil         *time.Time
+	LimitReason          string
 }
 
 type RequestRecord struct {
@@ -142,6 +176,12 @@ type Stats struct {
 	ImageGenTotalTokens  int64 `json:"image_gen_total_tokens"`
 }
 
+type DailyUsage struct {
+	Day         string `json:"day"`
+	Requests    int64  `json:"requests"`
+	TotalTokens int64  `json:"total_tokens"`
+}
+
 func (s *Store) CreateAPIKey(ctx context.Context, username, appName, machineName string, rateLimitRPS float64) (CreatedAPIKey, error) {
 	username = strings.TrimSpace(username)
 	appName = strings.TrimSpace(appName)
@@ -203,9 +243,16 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (APIKey, err
 
 func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id::text, username, app_name, machine_name, key_prefix, rate_limit_rps,
-			enabled, created_at, last_used_at, total_requests
-		FROM api_keys ORDER BY created_at DESC
+		SELECT k.id::text, k.username, k.app_name, k.machine_name, k.key_prefix, k.rate_limit_rps,
+			k.enabled, k.created_at, k.last_used_at, k.total_requests,
+			COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.total_tokens, 0)
+		FROM api_keys k
+		LEFT JOIN (
+			SELECT api_key_id, sum(input_tokens) input_tokens, sum(output_tokens) output_tokens,
+				sum(total_tokens) total_tokens
+			FROM requests GROUP BY api_key_id
+		) u ON u.api_key_id = k.id
+		ORDER BY k.created_at DESC
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("list API keys: %w", err)
@@ -218,12 +265,44 @@ func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 		if err := rows.Scan(
 			&key.ID, &key.Username, &key.AppName, &key.MachineName, &key.KeyPrefix,
 			&key.RateLimitRPS, &key.Enabled, &key.CreatedAt, &key.LastUsedAt, &key.TotalRequests,
+			&key.InputTokens, &key.OutputTokens, &key.TotalTokens,
 		); err != nil {
 			return nil, fmt.Errorf("scan API key: %w", err)
 		}
 		keys = append(keys, key)
 	}
 	return keys, rows.Err()
+}
+
+func (s *Store) APIKeyUsage(ctx context.Context) (map[string][]DailyUsage, error) {
+	rows, err := s.pool.Query(ctx, `
+		WITH usage_days AS (
+			SELECT generate_series(current_date - 6, current_date, '1 day')::date AS usage_date
+		)
+		SELECT k.id::text, d.usage_date, count(r.id), COALESCE(sum(r.total_tokens), 0)
+		FROM api_keys k
+		CROSS JOIN usage_days d
+		LEFT JOIN requests r ON r.api_key_id = k.id AND r.created_at::date = d.usage_date
+		GROUP BY k.id, d.usage_date
+		ORDER BY k.id, d.usage_date
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("load API key usage: %w", err)
+	}
+	defer rows.Close()
+
+	usage := make(map[string][]DailyUsage)
+	for rows.Next() {
+		var id string
+		var day time.Time
+		var point DailyUsage
+		if err := rows.Scan(&id, &day, &point.Requests, &point.TotalTokens); err != nil {
+			return nil, fmt.Errorf("scan API key usage: %w", err)
+		}
+		point.Day = day.Format(time.DateOnly)
+		usage[id] = append(usage[id], point)
+	}
+	return usage, rows.Err()
 }
 
 func (s *Store) RevokeAPIKey(ctx context.Context, id string) error {
@@ -275,10 +354,14 @@ func (s *Store) UpsertToken(ctx context.Context, token Token) (TokenSummary, err
 }
 
 func (s *Store) SelectToken(ctx context.Context) (Token, error) {
-	return s.queryToken(ctx, `
+	token, err := s.queryToken(ctx, `
 		WITH selected AS (
-			SELECT id FROM tokens
+			SELECT id FROM tokens t
 			WHERE enabled = true AND healthy = true
+				AND NOT EXISTS (
+					SELECT 1 FROM tokens limited
+					WHERE limited.account_id = t.account_id AND limited.limited_until > now()
+				)
 			ORDER BY last_used_at ASC NULLS FIRST, created_at ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
@@ -288,6 +371,18 @@ func (s *Store) SelectToken(ctx context.Context) (Token, error) {
 		RETURNING id::text, label, account_id, access_token_ciphertext,
 			refresh_token_ciphertext, access_token_expires_at
 	`)
+	if !errors.Is(err, ErrNoAvailableTokens) {
+		return token, err
+	}
+
+	var retryAt *time.Time
+	if retryErr := s.pool.QueryRow(ctx, `
+		SELECT min(limited_until) FROM tokens
+		WHERE enabled = true AND healthy = true AND limited_until > now()
+	`).Scan(&retryAt); retryErr != nil {
+		return Token{}, fmt.Errorf("find next available token: %w", retryErr)
+	}
+	return Token{}, &NoAvailableTokensError{RetryAt: retryAt}
 }
 
 func (s *Store) GetToken(ctx context.Context, id string) (Token, error) {
@@ -295,6 +390,7 @@ func (s *Store) GetToken(ctx context.Context, id string) (Token, error) {
 		SELECT id::text, label, account_id, access_token_ciphertext,
 			refresh_token_ciphertext, access_token_expires_at
 		FROM tokens WHERE id = $1 AND enabled = true AND healthy = true
+			AND (limited_until IS NULL OR limited_until <= now())
 	`, id)
 }
 
@@ -306,7 +402,7 @@ func (s *Store) queryToken(ctx context.Context, query string, args ...any) (Toke
 		&refreshCiphertext, &token.AccessTokenExpiresAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Token{}, ErrNoHealthyTokens
+		return Token{}, ErrNoAvailableTokens
 	}
 	if err != nil {
 		return Token{}, fmt.Errorf("select token: %w", err)
@@ -372,11 +468,46 @@ func (s *Store) MarkTokenUnhealthy(ctx context.Context, id, message string) erro
 	return nil
 }
 
+func (s *Store) UpdateTokenQuota(ctx context.Context, id string, quota TokenQuota) error {
+	result, err := s.pool.Exec(ctx, `
+		UPDATE tokens SET
+			plan_type = COALESCE(NULLIF($2, ''), plan_type),
+			active_limit = COALESCE(NULLIF($3, ''), active_limit),
+			primary_used_percent = COALESCE($4, primary_used_percent),
+			primary_reset_at = COALESCE($5, primary_reset_at),
+			secondary_used_percent = COALESCE($6, secondary_used_percent),
+			secondary_reset_at = COALESCE($7, secondary_reset_at),
+			limited_until = CASE
+				WHEN $8::timestamptz IS NOT NULL THEN GREATEST(limited_until, $8)
+				WHEN limited_until <= now() THEN NULL
+				ELSE limited_until
+			END,
+			limit_reason = CASE
+				WHEN $8::timestamptz IS NOT NULL THEN NULLIF($9, '')
+				WHEN limited_until <= now() THEN NULL
+				ELSE limit_reason
+			END
+		WHERE account_id = (SELECT account_id FROM tokens WHERE id = $1)
+	`, id, quota.PlanType, quota.ActiveLimit, quota.PrimaryUsedPercent, quota.PrimaryResetAt,
+		quota.SecondaryUsedPercent, quota.SecondaryResetAt, quota.LimitedUntil, quota.LimitReason)
+	if err != nil {
+		return fmt.Errorf("update token quota: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) ListTokens(ctx context.Context) ([]TokenSummary, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id::text, label, account_id, access_token_expires_at, healthy,
 			consecutive_failures, COALESCE(error_message, ''), enabled, created_at,
-			last_used_at, last_refreshed_at
+			last_used_at, last_refreshed_at, COALESCE(plan_type, ''),
+			COALESCE(active_limit, ''), primary_used_percent, primary_reset_at,
+			secondary_used_percent, secondary_reset_at,
+			CASE WHEN limited_until > now() THEN limited_until END,
+			CASE WHEN limited_until > now() THEN COALESCE(limit_reason, '') ELSE '' END
 		FROM tokens ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -391,6 +522,9 @@ func (s *Store) ListTokens(ctx context.Context) ([]TokenSummary, error) {
 			&token.ID, &token.Label, &token.AccountID, &token.AccessTokenExpiresAt,
 			&token.Healthy, &token.ConsecutiveFailures, &token.ErrorMessage, &token.Enabled,
 			&token.CreatedAt, &token.LastUsedAt, &token.LastRefreshedAt,
+			&token.PlanType, &token.ActiveLimit, &token.PrimaryUsedPercent, &token.PrimaryResetAt,
+			&token.SecondaryUsedPercent, &token.SecondaryResetAt, &token.LimitedUntil,
+			&token.LimitReason,
 		); err != nil {
 			return nil, fmt.Errorf("scan token: %w", err)
 		}
@@ -412,7 +546,14 @@ func (s *Store) DisableToken(ctx context.Context, id string) error {
 
 func (s *Store) HealthyTokenCount(ctx context.Context) (int64, error) {
 	var count int64
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM tokens WHERE enabled = true AND healthy = true`).Scan(&count); err != nil {
+	if err := s.pool.QueryRow(ctx, `
+		SELECT count(*) FROM tokens t
+		WHERE enabled = true AND healthy = true
+			AND NOT EXISTS (
+				SELECT 1 FROM tokens limited
+				WHERE limited.account_id = t.account_id AND limited.limited_until > now()
+			)
+	`).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count healthy tokens: %w", err)
 	}
 	return count, nil
@@ -508,7 +649,11 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM requests),
 			(SELECT count(*) FROM requests WHERE created_at >= date_trunc('day', now())),
 			(SELECT count(*) FROM api_keys WHERE enabled = true),
-			(SELECT count(*) FROM tokens WHERE enabled = true AND healthy = true),
+			(SELECT count(*) FROM tokens t WHERE enabled = true AND healthy = true
+				AND NOT EXISTS (
+					SELECT 1 FROM tokens limited
+					WHERE limited.account_id = t.account_id AND limited.limited_until > now()
+				)),
 			(SELECT count(*) FROM tokens WHERE enabled = true AND healthy = false),
 			COALESCE((SELECT sum(input_tokens) FROM requests), 0),
 			COALESCE((SELECT sum(cached_tokens) FROM requests), 0),

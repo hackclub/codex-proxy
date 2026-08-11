@@ -39,6 +39,14 @@ type pageData struct {
 	Notice     string
 }
 
+type dashboardSnapshot struct {
+	Stats    db.Stats                   `json:"stats"`
+	APIKeys  []db.APIKey                `json:"api_keys"`
+	KeyUsage map[string][]db.DailyUsage `json:"key_usage"`
+	Tokens   []db.TokenSummary          `json:"tokens"`
+	Requests []db.RecentRequest         `json:"requests"`
+}
+
 func NewHandler(store *db.Store, tokens *token.Manager, adminUser, adminPass string) *Handler {
 	return &Handler{
 		store:     store,
@@ -53,6 +61,8 @@ func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /admin", h.dashboard)
 	mux.HandleFunc("GET /admin/", h.dashboard)
+	mux.HandleFunc("GET /admin/dashboard.js", h.dashboardScript)
+	mux.HandleFunc("GET /admin/data", h.dashboardData)
 	mux.HandleFunc("POST /admin/keys", h.createKey)
 	mux.HandleFunc("DELETE /admin/keys/{id}", h.revokeKey)
 	mux.HandleFunc("POST /admin/keys/{id}/revoke", h.revokeKey)
@@ -72,6 +82,28 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 	data.CSRFToken = issueCSRFToken(w, r)
 	data.Notice = r.URL.Query().Get("notice")
 	h.render(w, http.StatusOK, data)
+}
+
+func (h *Handler) dashboardScript(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	_, _ = w.Write(dashboardJS)
+}
+
+func (h *Handler) dashboardData(w http.ResponseWriter, r *http.Request) {
+	data, err := h.loadPageData(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	usage, err := h.store.APIKeyUsage(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, dashboardSnapshot{
+		Stats: data.Stats, APIKeys: data.APIKeys, KeyUsage: usage,
+		Tokens: data.Tokens, Requests: data.Requests,
+	})
 }
 
 func (h *Handler) createKey(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +282,7 @@ func (h *Handler) basicAuth(next http.Handler) http.Handler {
 func (h *Handler) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")

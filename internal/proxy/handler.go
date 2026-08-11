@@ -8,23 +8,31 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/hackclub/codex-proxy/internal/db"
 	"github.com/hackclub/codex-proxy/internal/ratelimit"
-	"github.com/hackclub/codex-proxy/internal/token"
 )
 
 type Handler struct {
 	store               *db.Store
-	tokens              *token.Manager
+	tokens              tokenPool
 	limiter             *ratelimit.Limiter
 	upstreamURL         string
 	defaultInstructions string
 	maxRequestBytes     int64
 	httpClient          *http.Client
+}
+
+type tokenPool interface {
+	Borrow(context.Context) (db.Token, error)
+	ReportAuthFailure(context.Context, string, string)
+	ReportUsage(context.Context, string, http.Header) error
+	ReportRateLimit(context.Context, string, http.Header, []byte) (time.Time, error)
 }
 
 type HandlerConfig struct {
@@ -34,7 +42,7 @@ type HandlerConfig struct {
 	HTTPClient          *http.Client
 }
 
-func NewHandler(store *db.Store, tokens *token.Manager, limiter *ratelimit.Limiter, config HandlerConfig) *Handler {
+func NewHandler(store *db.Store, tokens tokenPool, limiter *ratelimit.Limiter, config HandlerConfig) *Handler {
 	client := config.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
@@ -103,6 +111,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	token, upstreamResponse, err := h.callUpstream(r.Context(), patchedBody, metadata)
 	if err != nil {
+		var unavailable *db.NoAvailableTokensError
+		if errors.As(err, &unavailable) {
+			status := http.StatusServiceUnavailable
+			typeName := "proxy_error"
+			message := "no token accounts are available"
+			if unavailable.RetryAt != nil {
+				status = http.StatusTooManyRequests
+				typeName = "usage_limit_reached"
+				message = "all token accounts have reached their usage limits"
+				w.Header().Set("Retry-After", retryAfterSeconds(*unavailable.RetryAt))
+			}
+			writeError(w, status, typeName, message)
+			record.StatusCode = status
+			record.ErrorMessage = err.Error()
+			h.record(started, record)
+			return
+		}
 		log.Printf("upstream request failed: %v", err)
 		writeError(w, http.StatusBadGateway, "upstream_error", "Codex upstream request failed")
 		record.TokenID = token.ID
@@ -186,11 +211,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) callUpstream(ctx context.Context, body []byte, metadata RequestMetadata) (db.Token, *http.Response, error) {
 	var lastToken db.Token
-	for attempt := 0; attempt < 2; attempt++ {
+	var lastRateLimit *http.Response
+	attempted := make(map[string]bool)
+	for {
 		token, err := h.tokens.Borrow(ctx)
 		if err != nil {
+			if lastRateLimit != nil && errors.Is(err, db.ErrNoAvailableTokens) {
+				return lastToken, lastRateLimit, nil
+			}
 			return lastToken, nil, err
 		}
+		if attempted[token.ID] {
+			return lastToken, nil, errors.New("token pool selected the same rejected token twice")
+		}
+		attempted[token.ID] = true
 		lastToken = token
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.upstreamURL, bytes.NewReader(body))
@@ -213,18 +247,40 @@ func (h *Handler) callUpstream(ctx context.Context, body []byte, metadata Reques
 		if err != nil {
 			return token, nil, err
 		}
+		if response.StatusCode == http.StatusTooManyRequests {
+			responseBody, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if readErr != nil {
+				return token, nil, fmt.Errorf("read upstream rate limit: %w", readErr)
+			}
+			response.Body = io.NopCloser(bytes.NewReader(responseBody))
+			limitedUntil, reportErr := h.tokens.ReportRateLimit(ctx, token.ID, response.Header, responseBody)
+			if reportErr != nil {
+				log.Printf("record token rate limit: %v", reportErr)
+				return token, response, nil
+			}
+			if response.Header.Get("Retry-After") == "" {
+				response.Header.Set("Retry-After", retryAfterSeconds(limitedUntil))
+			}
+			lastRateLimit = response
+			continue
+		}
+
 		if response.StatusCode != http.StatusUnauthorized && response.StatusCode != http.StatusForbidden {
+			if err := h.tokens.ReportUsage(ctx, token.ID, response.Header); err != nil {
+				log.Printf("record token usage: %v", err)
+			}
 			return token, response, nil
 		}
 
 		h.tokens.ReportAuthFailure(ctx, token.ID, fmt.Sprintf("upstream HTTP %d", response.StatusCode))
-		if attempt == 1 {
-			return token, response, nil
-		}
 		_, _ = io.Copy(io.Discard, response.Body)
 		_ = response.Body.Close()
 	}
-	return lastToken, nil, errors.New("upstream authentication failed")
+}
+
+func retryAfterSeconds(retryAt time.Time) string {
+	return strconv.FormatInt(max(1, int64(math.Ceil(time.Until(retryAt).Seconds()))), 10)
 }
 
 func (h *Handler) record(started time.Time, record db.RequestRecord) {
