@@ -79,7 +79,7 @@ func TestPatchPayloadForResponsesLite(t *testing.T) {
 	if _, ok := payload["tools"]; ok {
 		t.Fatal("top-level tools survived")
 	}
-	if payload["parallel_tool_calls"] != false || payload["tool_choice"] != "auto" {
+	if payload["parallel_tool_calls"] != true || payload["tool_choice"] != "auto" {
 		t.Fatalf("tool settings = %#v, %#v", payload["parallel_tool_calls"], payload["tool_choice"])
 	}
 	input := payload["input"].([]any)
@@ -93,6 +93,24 @@ func TestPatchPayloadForResponsesLite(t *testing.T) {
 	reasoning := payload["reasoning"].(map[string]any)
 	if reasoning["context"] != "all_turns" {
 		t.Fatalf("reasoning = %#v", reasoning)
+	}
+}
+
+func TestPatchPayloadForResponsesLiteDefaultsParallelToolCallsToFalse(t *testing.T) {
+	patched, _, err := PatchPayload([]byte(`{
+		"model":"gpt-5.6-terra",
+		"input":"hello",
+		"tools":[{"type":"function","name":"lookup"}]
+	}`), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(patched, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["parallel_tool_calls"] != false {
+		t.Fatalf("parallel_tool_calls should default to false, got %#v", payload["parallel_tool_calls"])
 	}
 }
 
