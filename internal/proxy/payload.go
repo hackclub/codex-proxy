@@ -80,7 +80,9 @@ func applyResponsesLite(payload map[string]any) {
 		})
 	}
 	payload["input"] = append(prefix, input...)
-	payload["parallel_tool_calls"] = false
+	if _, ok := payload["parallel_tool_calls"]; !ok {
+		payload["parallel_tool_calls"] = false
+	}
 	if payload["tool_choice"] != "none" && payload["tool_choice"] != "required" {
 		payload["tool_choice"] = "auto"
 	}
