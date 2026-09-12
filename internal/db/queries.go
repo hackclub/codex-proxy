@@ -478,7 +478,7 @@ func (s *Store) UpdateTokenQuota(ctx context.Context, id string, quota TokenQuot
 			secondary_used_percent = COALESCE($6, secondary_used_percent),
 			secondary_reset_at = COALESCE($7, secondary_reset_at),
 			limited_until = CASE
-				WHEN $8::timestamptz IS NOT NULL THEN GREATEST(limited_until, $8)
+				WHEN $8::timestamptz IS NOT NULL THEN $8
 				WHEN limited_until <= now() THEN NULL
 				ELSE limited_until
 			END,
