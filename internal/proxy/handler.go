@@ -30,6 +30,7 @@ type Handler struct {
 
 type tokenPool interface {
 	Borrow(context.Context) (db.Token, error)
+	Reauthenticate(context.Context, db.Token) (db.Token, error)
 	ReportAuthFailure(context.Context, string, string)
 	ReportUsage(context.Context, string, http.Header) error
 	ReportRateLimit(context.Context, string, http.Header, []byte) (time.Time, error)
@@ -222,30 +223,34 @@ func (h *Handler) callUpstream(ctx context.Context, body []byte, metadata Reques
 			return lastToken, nil, err
 		}
 		if attempted[token.ID] {
-			return lastToken, nil, errors.New("token pool selected the same rejected token twice")
+			// Tokens that failed auth stay in the pool until they hit the
+			// failure threshold, so the pool can hand one back to us.
+			if lastRateLimit != nil {
+				return lastToken, lastRateLimit, nil
+			}
+			return lastToken, nil, &db.NoAvailableTokensError{}
 		}
 		attempted[token.ID] = true
 		lastToken = token
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.upstreamURL, bytes.NewReader(body))
-		if err != nil {
-			return token, nil, fmt.Errorf("create upstream request: %w", err)
-		}
-		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-		req.Header.Set("ChatGPT-Account-ID", token.AccountID)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("User-Agent", "codex-proxy/1.0")
-		req.Header.Set("OpenAI-Beta", "responses=experimental")
-		req.Header.Set("Originator", "codex-proxy")
-		req.Header.Set("Version", "0.144.1")
-		if metadata.ResponsesLite {
-			req.Header.Set("X-OpenAI-Internal-Codex-Responses-Lite", "true")
-		}
-
-		response, err := h.httpClient.Do(req)
+		response, err := h.send(ctx, token, body, metadata)
 		if err != nil {
 			return token, nil, err
+		}
+		if isAuthFailure(response.StatusCode) {
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+			refreshed, refreshErr := h.tokens.Reauthenticate(ctx, token)
+			if refreshErr != nil {
+				log.Printf("reauthenticate token after upstream HTTP %d: %v", response.StatusCode, refreshErr)
+				continue
+			}
+			token = refreshed
+			lastToken = token
+			response, err = h.send(ctx, token, body, metadata)
+			if err != nil {
+				return token, nil, err
+			}
 		}
 		if response.StatusCode == http.StatusTooManyRequests {
 			responseBody, readErr := io.ReadAll(response.Body)
@@ -266,17 +271,40 @@ func (h *Handler) callUpstream(ctx context.Context, body []byte, metadata Reques
 			continue
 		}
 
-		if response.StatusCode != http.StatusUnauthorized && response.StatusCode != http.StatusForbidden {
+		if !isAuthFailure(response.StatusCode) {
 			if err := h.tokens.ReportUsage(ctx, token.ID, response.Header); err != nil {
 				log.Printf("record token usage: %v", err)
 			}
 			return token, response, nil
 		}
 
-		h.tokens.ReportAuthFailure(ctx, token.ID, fmt.Sprintf("upstream HTTP %d", response.StatusCode))
+		h.tokens.ReportAuthFailure(ctx, token.ID, fmt.Sprintf("upstream HTTP %d after refresh", response.StatusCode))
 		_, _ = io.Copy(io.Discard, response.Body)
 		_ = response.Body.Close()
 	}
+}
+
+func (h *Handler) send(ctx context.Context, token db.Token, body []byte, metadata RequestMetadata) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create upstream request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
+	req.Header.Set("ChatGPT-Account-ID", token.AccountID)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("User-Agent", "codex-proxy/1.0")
+	req.Header.Set("OpenAI-Beta", "responses=experimental")
+	req.Header.Set("Originator", "codex-proxy")
+	req.Header.Set("Version", "0.144.1")
+	if metadata.ResponsesLite {
+		req.Header.Set("X-OpenAI-Internal-Codex-Responses-Lite", "true")
+	}
+	return h.httpClient.Do(req)
+}
+
+func isAuthFailure(status int) bool {
+	return status == http.StatusUnauthorized || status == http.StatusForbidden
 }
 
 func retryAfterSeconds(retryAt time.Time) string {

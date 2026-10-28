@@ -457,17 +457,6 @@ func (s *Store) RecordTokenFailure(ctx context.Context, id, message string, thre
 	return nil
 }
 
-func (s *Store) MarkTokenUnhealthy(ctx context.Context, id, message string) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE tokens SET healthy = false, consecutive_failures = consecutive_failures + 1, error_message = $2
-		WHERE id = $1
-	`, id, message)
-	if err != nil {
-		return fmt.Errorf("mark token unhealthy: %w", err)
-	}
-	return nil
-}
-
 func (s *Store) UpdateTokenQuota(ctx context.Context, id string, quota TokenQuota) error {
 	result, err := s.pool.Exec(ctx, `
 		UPDATE tokens SET

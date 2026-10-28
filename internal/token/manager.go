@@ -116,6 +116,28 @@ func (m *Manager) Borrow(ctx context.Context) (db.Token, error) {
 		return token, nil
 	}
 
+	return m.refreshAndStore(ctx, token)
+}
+
+// Reauthenticate refreshes a token whose access token upstream rejected, even
+// if it hasn't expired yet. If another request already refreshed it, the
+// stored credentials are returned instead of refreshing again.
+func (m *Manager) Reauthenticate(ctx context.Context, rejected db.Token) (db.Token, error) {
+	lock := m.tokenLock(rejected.ID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	token, err := m.store.GetToken(ctx, rejected.ID)
+	if err != nil {
+		return db.Token{}, err
+	}
+	if token.AccessToken != rejected.AccessToken && !m.needsRefresh(token) {
+		return token, nil
+	}
+	return m.refreshAndStore(ctx, token)
+}
+
+func (m *Manager) refreshAndStore(ctx context.Context, token db.Token) (db.Token, error) {
 	refreshed, err := m.refresh(ctx, token.RefreshToken)
 	if err != nil {
 		_ = m.store.RecordTokenFailure(ctx, token.ID, err.Error(), m.failureThreshold)
@@ -143,7 +165,7 @@ func (m *Manager) Borrow(ctx context.Context) (db.Token, error) {
 
 func (m *Manager) ReportAuthFailure(ctx context.Context, tokenID, message string) {
 	if tokenID != "" {
-		_ = m.store.MarkTokenUnhealthy(ctx, tokenID, message)
+		_ = m.store.RecordTokenFailure(ctx, tokenID, message, m.failureThreshold)
 	}
 }
 
