@@ -97,6 +97,7 @@ type TokenQuota struct {
 	SecondaryResetAt     *time.Time
 	LimitedUntil         *time.Time
 	LimitReason          string
+	ClearLimit           bool
 }
 
 type RequestRecord struct {
@@ -354,6 +355,10 @@ func (s *Store) UpsertToken(ctx context.Context, token Token) (TokenSummary, err
 }
 
 func (s *Store) SelectToken(ctx context.Context) (Token, error) {
+	// An account out of quota still gets one request every 5 minutes, because a
+	// plan upgrade can lift the limit long before limited_until. Upstream
+	// rejecting it costs one round trip, then the caller fails over to the next
+	// token. Temporary rate limits wait out their full Retry-After.
 	token, err := s.queryToken(ctx, `
 		WITH selected AS (
 			SELECT id FROM tokens t
@@ -361,6 +366,8 @@ func (s *Store) SelectToken(ctx context.Context) (Token, error) {
 				AND NOT EXISTS (
 					SELECT 1 FROM tokens limited
 					WHERE limited.account_id = t.account_id AND limited.limited_until > now()
+						AND (limited.limit_reason IS DISTINCT FROM 'usage_limit_reached'
+							OR limited.last_used_at > now() - interval '5 minutes')
 				)
 			ORDER BY last_used_at ASC NULLS FIRST, created_at ASC
 			FOR UPDATE SKIP LOCKED
@@ -390,7 +397,6 @@ func (s *Store) GetToken(ctx context.Context, id string) (Token, error) {
 		SELECT id::text, label, account_id, access_token_ciphertext,
 			refresh_token_ciphertext, access_token_expires_at
 		FROM tokens WHERE id = $1 AND enabled = true AND healthy = true
-			AND (limited_until IS NULL OR limited_until <= now())
 	`, id)
 }
 
@@ -468,17 +474,17 @@ func (s *Store) UpdateTokenQuota(ctx context.Context, id string, quota TokenQuot
 			secondary_reset_at = COALESCE($7, secondary_reset_at),
 			limited_until = CASE
 				WHEN $8::timestamptz IS NOT NULL THEN $8
-				WHEN limited_until <= now() THEN NULL
+				WHEN $10::boolean OR limited_until <= now() THEN NULL
 				ELSE limited_until
 			END,
 			limit_reason = CASE
 				WHEN $8::timestamptz IS NOT NULL THEN NULLIF($9, '')
-				WHEN limited_until <= now() THEN NULL
+				WHEN $10::boolean OR limited_until <= now() THEN NULL
 				ELSE limit_reason
 			END
 		WHERE account_id = (SELECT account_id FROM tokens WHERE id = $1)
 	`, id, quota.PlanType, quota.ActiveLimit, quota.PrimaryUsedPercent, quota.PrimaryResetAt,
-		quota.SecondaryUsedPercent, quota.SecondaryResetAt, quota.LimitedUntil, quota.LimitReason)
+		quota.SecondaryUsedPercent, quota.SecondaryResetAt, quota.LimitedUntil, quota.LimitReason, quota.ClearLimit)
 	if err != nil {
 		return fmt.Errorf("update token quota: %w", err)
 	}

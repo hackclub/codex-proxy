@@ -169,11 +169,14 @@ func (m *Manager) ReportAuthFailure(ctx context.Context, tokenID, message string
 	}
 }
 
-func (m *Manager) ReportUsage(ctx context.Context, tokenID string, headers http.Header) error {
+func (m *Manager) ReportUsage(ctx context.Context, tokenID string, status int, headers http.Header) error {
 	if tokenID == "" {
 		return nil
 	}
-	return m.store.UpdateTokenQuota(ctx, tokenID, quotaFromHeaders(headers))
+	quota := quotaFromHeaders(headers)
+	// Upstream accepted a request, so whatever limit we had saved is over.
+	quota.ClearLimit = status >= 200 && status < 300
+	return m.store.UpdateTokenQuota(ctx, tokenID, quota)
 }
 
 func (m *Manager) ReportRateLimit(ctx context.Context, tokenID string, headers http.Header, body []byte) (time.Time, error) {

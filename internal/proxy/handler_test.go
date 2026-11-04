@@ -46,7 +46,7 @@ func (p *fakeTokenPool) ReportAuthFailure(_ context.Context, tokenID, _ string) 
 	p.authFailed = append(p.authFailed, tokenID)
 }
 
-func (p *fakeTokenPool) ReportUsage(_ context.Context, tokenID string, _ http.Header) error {
+func (p *fakeTokenPool) ReportUsage(_ context.Context, tokenID string, _ int, _ http.Header) error {
 	p.used = append(p.used, tokenID)
 	return nil
 }

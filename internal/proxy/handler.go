@@ -32,7 +32,7 @@ type tokenPool interface {
 	Borrow(context.Context) (db.Token, error)
 	Reauthenticate(context.Context, db.Token) (db.Token, error)
 	ReportAuthFailure(context.Context, string, string)
-	ReportUsage(context.Context, string, http.Header) error
+	ReportUsage(context.Context, string, int, http.Header) error
 	ReportRateLimit(context.Context, string, http.Header, []byte) (time.Time, error)
 }
 
@@ -272,7 +272,7 @@ func (h *Handler) callUpstream(ctx context.Context, body []byte, metadata Reques
 		}
 
 		if !isAuthFailure(response.StatusCode) {
-			if err := h.tokens.ReportUsage(ctx, token.ID, response.Header); err != nil {
+			if err := h.tokens.ReportUsage(ctx, token.ID, response.StatusCode, response.Header); err != nil {
 				log.Printf("record token usage: %v", err)
 			}
 			return token, response, nil
